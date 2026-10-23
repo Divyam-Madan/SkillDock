@@ -1,6 +1,6 @@
 # SkillDock
 
-Made by Sukhani and Divyam, because apparently boredom is a startup idea.
+Build because, apparently boredom is a startup idea.
 
 SkillDock is a full-stack recruiting intelligence platform for technical hiring teams. It ingests job descriptions, scores a candidate pool against the role, and surfaces ranked shortlists with explainable match reasoning, skills gaps, and recruiter-friendly summaries.
 
@@ -353,10 +353,6 @@ This repository does not currently specify a license in the project metadata. Pl
 ## Status
 
 SkillDock is a functional recruiting intelligence platform prototype focused on candidate ranking, explainability, and recruiter workflow support.
-
-## Repository
-
-- GitHub: https://github.com/suhani2810/SkillDock
 
 ## Notes
 
