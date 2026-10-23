@@ -26,7 +26,7 @@ export default function Dashboard() {
   const { data: rankings, isLoading: rankingsLoading } = useListRankings();
 
   const recentRankings = Array.isArray(rankings) ? rankings.slice(0, 5) : [];
-  const candidatesArray = Array.isArray(candidates) ? candidates : [];
+  const candidatesArray = Array.isArray(candidates?.candidates) ? candidates.candidates : [];
   const topSkills = Array.isArray(stats?.topSkills) ? stats.topSkills : [];
   const averageExperience =
     typeof stats?.avgExperience === "number" ? stats.avgExperience.toFixed(1) : "0.0";

@@ -1,8 +1,8 @@
 import React, { useState, useMemo } from "react";
 import { useParams, useLocation } from "wouter";
 import {
-  useGetRanking, useListRankedCandidates, useGetRankingStats, useExportRanking,
-  getGetRankingQueryKey, getListRankedCandidatesQueryKey,
+  useGetRanking, useGetRankingStats, useExportRanking,
+  getGetRankingQueryKey,
   getGetRankingStatsQueryKey, getExportRankingQueryKey,
 } from "@workspace/api-client-react";
 import {
@@ -90,9 +90,15 @@ export default function RankingDetailPage() {
   const [, navigate] = useLocation();
   const rankingId = Number(id);
 
-  const { data: run, isLoading: runLoading } = useGetRanking(rankingId, { query: { queryKey: getGetRankingQueryKey(rankingId), enabled: !!rankingId } });
-  const { data: results, isLoading: resultsLoading } = useListRankedCandidates(rankingId, { query: { queryKey: getListRankedCandidatesQueryKey(rankingId), enabled: !!rankingId } });
-  const { data: stats } = useGetRankingStats(rankingId, { query: { queryKey: getGetRankingStatsQueryKey(rankingId), enabled: !!rankingId } });
+  const { data: run, isLoading: runLoading } = useGetRanking(rankingId, { query: {
+    queryKey: getGetRankingQueryKey(rankingId),
+    enabled: !!rankingId,
+    refetchInterval: (query) => query.state.data?.status === "running" || query.state.data?.status === "pending" ? 2000 : false,
+  } });
+  const rankingComplete = run?.status === "completed";
+  const results = run?.results;
+  const resultsLoading = runLoading || (rankingComplete && !run?.results);
+  const { data: stats } = useGetRankingStats(rankingId, { query: { queryKey: getGetRankingStatsQueryKey(rankingId), enabled: !!rankingId && rankingComplete } });
   const { refetch: fetchExport } = useExportRanking(rankingId, { query: { queryKey: getExportRankingQueryKey(rankingId), enabled: false } });
 
   const [search, setSearch] = useState("");
@@ -102,6 +108,11 @@ export default function RankingDetailPage() {
 
   // Ensure results is always an array
   const resultsArray = Array.isArray(results) ? results : [];
+  const processedCandidates = run?.processedCandidates ?? 0;
+  const totalCandidates = run?.totalCandidates ?? 0;
+  const progressPercent = totalCandidates > 0
+    ? Math.min(100, (processedCandidates / totalCandidates) * 100)
+    : 0;
 
   const toggleExpand = (id: number) => {
     setExpandedIds((prev) => {
@@ -265,7 +276,29 @@ export default function RankingDetailPage() {
       </div>
 
       {/* Results */}
-      {resultsLoading ? (
+      {run.status === "pending" || run.status === "running" ? (
+        <Card className="border-dashed">
+          <CardContent className="flex flex-col items-center py-12 text-center">
+            <Activity className="h-8 w-8 text-primary mb-3 animate-pulse" />
+            <p className="font-medium">Ranking candidates…</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {processedCandidates.toLocaleString()} / {totalCandidates > 0 ? totalCandidates.toLocaleString() : "…"} candidates scored
+            </p>
+            <div className="mt-4 h-2 w-full max-w-md overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progressPercent)}>
+              <div className="h-full rounded-full bg-primary transition-[width] duration-300" style={{ width: `${progressPercent}%` }} />
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">This page updates automatically.</p>
+          </CardContent>
+        </Card>
+      ) : run.status === "failed" ? (
+        <Card className="border-red-200">
+          <CardContent className="flex flex-col items-center py-12 text-center">
+            <AlertCircle className="h-8 w-8 text-red-500 mb-3" />
+            <p className="font-medium">This ranking could not be completed.</p>
+            <p className="mt-1 text-sm text-muted-foreground">Return to the dashboard and start a new run.</p>
+          </CardContent>
+        </Card>
+      ) : resultsLoading ? (
         <div className="space-y-3">{[1,2,3].map(i => <Skeleton key={i} className="h-28" />)}</div>
       ) : filtered.length === 0 ? (
         <Card className="border-dashed">

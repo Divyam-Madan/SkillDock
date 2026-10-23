@@ -1,23 +1,34 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useListCandidates, useGetCandidateStats } from "@workspace/api-client-react";
-import { Search, Users } from "lucide-react";
+import { ChevronLeft, ChevronRight, Search, Users } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 const COLORS = ["#d4a574", "#9ca3af", "#d1d5db", "#e5e7eb", "#f3f4f6", "#fafafa"];
+const PAGE_SIZE = 25;
 
 export default function CandidatesPage() {
   const [search, setSearch] = useState("");
-  const { data: candidates, isLoading } = useListCandidates(
-    search ? { search } : undefined,
-  );
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [offset, setOffset] = useState(0);
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => window.clearTimeout(timeout);
+  }, [search]);
+
+  const { data: page, isLoading, isFetching } = useListCandidates({
+    search: debouncedSearch || undefined,
+    limit: PAGE_SIZE,
+    offset,
+  });
   const { data: stats } = useGetCandidateStats();
 
   // Ensure arrays are always safe
-  const candidatesArray = Array.isArray(candidates) ? candidates : [];
+  const candidatesArray = Array.isArray(page?.candidates) ? page.candidates : [];
   const educationBreakdown = Array.isArray(stats?.educationBreakdown)
     ? stats.educationBreakdown
     : [];
@@ -89,8 +100,27 @@ export default function CandidatesPage() {
           placeholder="Search by name, title, or company..."
           className="pl-9 border-slate-300 bg-white text-slate-900 placeholder:text-slate-500"
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setOffset(0);
+          }}
         />
+      </div>
+
+      <div className="flex items-center justify-between gap-3 text-sm text-slate-600">
+        <span>
+          {candidatesArray.length > 0
+            ? `Showing ${offset + 1}-${offset + candidatesArray.length} · ${stats?.total?.toLocaleString() ?? "…"} in pool`
+            : `${stats?.total?.toLocaleString() ?? "…"} in pool`}
+        </span>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" disabled={offset === 0 || isFetching} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>
+            <ChevronLeft className="mr-1 h-4 w-4" /> Previous
+          </Button>
+          <Button variant="outline" size="sm" disabled={!page?.hasMore || isFetching} onClick={() => setOffset(offset + PAGE_SIZE)}>
+            Next <ChevronRight className="ml-1 h-4 w-4" />
+          </Button>
+        </div>
       </div>
 
       {/* Candidates List */}

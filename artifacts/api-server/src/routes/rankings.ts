@@ -1,8 +1,9 @@
 import { Router } from "express";
-import { db, jobsTable, candidatesTable, rankingRunsTable, rankingResultsTable } from "@workspace/db";
-import { desc, eq } from "drizzle-orm";
-import { scoreCandidate } from "../lib/scorer";
+import { db, pool, jobsTable, candidatesTable, rankingRunsTable, rankingResultsTable } from "@workspace/db";
+import { asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { createCandidateScorer, type CandidateScoringProfile, type ScoreBreakdown } from "../lib/scorer";
 import { generateRationale } from "../lib/openai";
+import { logger } from "../lib/logger";
 import {
   CreateRankingBody,
   GetRankingParams,
@@ -12,6 +13,14 @@ import {
 } from "@workspace/api-zod";
 
 const router = Router();
+const CANDIDATE_BATCH_SIZE = 5000;
+const MAX_BATCH_ATTEMPTS = 3;
+const rankingProgress = new Map<number, { processedCandidates: number; totalCandidates: number }>();
+
+interface ScoredCandidate {
+  candidate: CandidateScoringProfile;
+  score: ScoreBreakdown;
+}
 
 router.get("/", async (req, res) => {
   try {
@@ -38,72 +47,13 @@ router.post("/", async (req, res) => {
 
     const [run] = await db
       .insert(rankingRunsTable)
-      .values({ jobId, status: "running", topN, minScore })
+      .values({ jobId, status: "pending", topN, minScore })
       .returning();
 
-    const candidates = await db.select().from(candidatesTable);
-
-    const scored = candidates.map((c) => ({
-      candidate: c,
-      ...scoreCandidate(job, c),
-    }));
-
-    const filtered = scored
-      .filter((s) => s.compositeScore >= (minScore ?? 40))
-      .sort((a, b) => b.compositeScore - a.compositeScore)
-      .slice(0, topN ?? 15);
-
-    const rationalePromises = filtered.map((s) =>
-      generateRationale(
-        job.title,
-        (job.requiredSkills as string[]) ?? [],
-        {
-          name: s.candidate.name,
-          currentTitle: s.candidate.currentTitle,
-          yearsExperience: s.candidate.yearsExperience,
-          skills: (s.candidate.skills as string[]) ?? [],
-        },
-        {
-          compositeScore: s.compositeScore,
-          matchedSkills: s.matchedSkills,
-          missingSkills: s.missingSkills,
-        },
-      ).catch(() => `${s.candidate.name} scored ${s.compositeScore}/100 for this role.`),
-    );
-
-    const rationales = await Promise.all(rationalePromises);
-
-    const resultRows = filtered.map((s, idx) => ({
-      rankingId: run.id,
-      candidateId: s.candidate.id,
-      rank: idx + 1,
-      compositeScore: s.compositeScore,
-      semanticScore: s.semanticScore,
-      experienceScore: s.experienceScore,
-      educationScore: s.educationScore,
-      activityScore: s.activityScore,
-      trajectoryScore: s.trajectoryScore,
-      rationale: rationales[idx],
-      matchedSkills: s.matchedSkills,
-      missingSkills: s.missingSkills,
-    }));
-
-    if (resultRows.length > 0) {
-      await db.insert(rankingResultsTable).values(resultRows);
-    }
-
-    const [updated] = await db
-      .update(rankingRunsTable)
-      .set({
-        status: "completed",
-        totalCandidates: candidates.length,
-        shortlistedCount: filtered.length,
-        completedAt: new Date(),
-      })
-      .where(eq(rankingRunsTable.id, run.id))
-      .returning();
-
-    res.status(201).json(serializeRun(updated, job.title));
+    res.status(202).json(serializeRun(run, job.title));
+    setImmediate(() => {
+      void processRankingRun(run.id, job, topN ?? 15, minScore ?? 40);
+    });
   } catch (err) {
     req.log.error({ err }, "Failed to create ranking");
     res.status(500).json({ error: "Failed to create ranking" });
@@ -119,10 +69,13 @@ router.get("/:id", async (req, res) => {
     if (!run) { res.status(404).json({ error: "Ranking not found" }); return; }
 
     const [job] = await db.select({ title: jobsTable.title }).from(jobsTable).where(eq(jobsTable.id, run.jobId));
-    const results = await fetchResultsWithCandidates(run.id);
+    const results = run.status === "completed" ? await fetchResultsWithCandidates(run.id) : [];
+    const progress = rankingProgress.get(run.id);
 
     res.json({
       ...serializeRun(run, job?.title ?? null),
+      totalCandidates: run.totalCandidates ?? progress?.totalCandidates ?? null,
+      processedCandidates: progress?.processedCandidates ?? (run.status === "completed" ? run.totalCandidates ?? 0 : 0),
       results,
     });
   } catch (err) {
@@ -246,12 +199,7 @@ async function fetchResultsWithCandidates(rankingId: number) {
   const candidates = await db
     .select()
     .from(candidatesTable)
-    .where(eq(candidatesTable.id, candidateIds[0]));
-
-  for (let i = 1; i < candidateIds.length; i++) {
-    const more = await db.select().from(candidatesTable).where(eq(candidatesTable.id, candidateIds[i]));
-    candidates.push(...more);
-  }
+    .where(inArray(candidatesTable.id, candidateIds));
 
   const candMap = new Map(
     candidates.map((c) => [
@@ -282,6 +230,134 @@ async function fetchResultsWithCandidates(rankingId: number) {
       missingSkills: (r.missingSkills as string[]) ?? [],
       candidate: candMap.get(r.candidateId)!,
     }));
+}
+
+async function processRankingRun(rankingId: number, job: typeof jobsTable.$inferSelect, topN: number, minScore: number): Promise<void> {
+  try {
+    await db.update(rankingRunsTable).set({ status: "running" }).where(eq(rankingRunsTable.id, rankingId));
+    const countResult = await pool.query<{ count: string }>("select count(*) as count from candidates");
+    const expectedCandidates = Number(countResult.rows[0]?.count ?? 0);
+    rankingProgress.set(rankingId, { processedCandidates: 0, totalCandidates: expectedCandidates });
+
+    const scoreCandidate = createCandidateScorer(job);
+    const shortlist: ScoredCandidate[] = [];
+    let lastCandidateId = 0;
+    let totalCandidates = 0;
+
+    while (true) {
+      const candidates = await fetchCandidateBatch(lastCandidateId);
+      if (candidates.length === 0) break;
+
+      totalCandidates += candidates.length;
+      lastCandidateId = candidates[candidates.length - 1].id;
+
+      for (const candidate of candidates) {
+        const score = scoreCandidate(candidate);
+        if (score.compositeScore >= minScore) shortlist.push({ candidate, score });
+      }
+      rankingProgress.set(rankingId, { processedCandidates: totalCandidates, totalCandidates: expectedCandidates });
+
+      shortlist.sort((left, right) =>
+        right.score.compositeScore - left.score.compositeScore || left.candidate.id - right.candidate.id,
+      );
+      if (shortlist.length > topN) shortlist.length = topN;
+
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const rationales = await Promise.all(shortlist.map(({ candidate, score }) =>
+      generateRationale(
+        job.title,
+        (job.requiredSkills as string[]) ?? [],
+        {
+          name: candidate.name,
+          currentTitle: candidate.currentTitle,
+          yearsExperience: candidate.yearsExperience,
+          skills: (candidate.skills as string[]) ?? [],
+        },
+        {
+          compositeScore: score.compositeScore,
+          matchedSkills: score.matchedSkills,
+          missingSkills: score.missingSkills,
+        },
+      ).catch(() => `${candidate.name} scored ${score.compositeScore}/100 for this role.`),
+    ));
+
+    const resultRows = shortlist.map(({ candidate, score }, index) => ({
+      rankingId,
+      candidateId: candidate.id,
+      rank: index + 1,
+      compositeScore: score.compositeScore,
+      semanticScore: score.semanticScore,
+      experienceScore: score.experienceScore,
+      educationScore: score.educationScore,
+      activityScore: score.activityScore,
+      trajectoryScore: score.trajectoryScore,
+      rationale: rationales[index],
+      matchedSkills: score.matchedSkills,
+      missingSkills: score.missingSkills,
+    }));
+
+    if (resultRows.length > 0) await db.insert(rankingResultsTable).values(resultRows);
+
+    await db.update(rankingRunsTable).set({
+      status: "completed",
+      totalCandidates,
+      shortlistedCount: shortlist.length,
+      completedAt: new Date(),
+    }).where(eq(rankingRunsTable.id, rankingId));
+    rankingProgress.delete(rankingId);
+  } catch (err) {
+    logger.error({ err, rankingId }, "Ranking run failed");
+    rankingProgress.delete(rankingId);
+    try {
+      await db.update(rankingRunsTable).set({ status: "failed", completedAt: new Date() })
+        .where(eq(rankingRunsTable.id, rankingId));
+    } catch (statusErr) {
+      logger.error({ err: statusErr, rankingId }, "Could not persist failed ranking status");
+    }
+  }
+}
+
+async function fetchCandidateBatch(lastCandidateId: number): Promise<CandidateScoringProfile[]> {
+  for (let attempt = 1; attempt <= MAX_BATCH_ATTEMPTS; attempt++) {
+    try {
+      return await db
+        .select({
+          id: candidatesTable.id,
+          name: candidatesTable.name,
+          email: candidatesTable.email,
+          currentTitle: candidatesTable.currentTitle,
+          currentCompany: candidatesTable.currentCompany,
+          yearsExperience: candidatesTable.yearsExperience,
+          educationLevel: candidatesTable.educationLevel,
+          skills: candidatesTable.skills,
+          resumeText: sql<string | null>`left(${candidatesTable.resumeText}, 1200)`,
+          location: candidatesTable.location,
+          linkedinUrl: candidatesTable.linkedinUrl,
+          activityScore: candidatesTable.activityScore,
+        })
+        .from(candidatesTable)
+        .where(gt(candidatesTable.id, lastCandidateId))
+        .orderBy(asc(candidatesTable.id))
+        .limit(CANDIDATE_BATCH_SIZE);
+    } catch (err) {
+      if (!isTransientDatabaseError(err) || attempt === MAX_BATCH_ATTEMPTS) throw err;
+      logger.warn({ err, attempt, lastCandidateId }, "Retrying transient candidate batch query");
+      await new Promise<void>((resolve) => setTimeout(resolve, attempt * 500));
+    }
+  }
+
+  return [];
+}
+
+function isTransientDatabaseError(err: unknown): boolean {
+  const error = err as { code?: unknown; cause?: { code?: unknown; message?: unknown }; message?: unknown };
+  const code = String(error?.cause?.code ?? error?.code ?? "");
+  const message = `${String(error?.message ?? "")} ${String(error?.cause?.message ?? "")}`.toLowerCase();
+  return ["ENOTFOUND", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE"].includes(code) ||
+    message.includes("connection terminated unexpectedly") ||
+    message.includes("socket hang up");
 }
 
 function serializeRun(run: typeof rankingRunsTable.$inferSelect, jobTitle: string | null) {

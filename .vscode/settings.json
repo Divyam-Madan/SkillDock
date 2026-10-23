@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^node -e \"const \\{Pool\\}=require\\('pg'\\); const pool = new Pool\\(\\{connectionString: 'postgresql://postgres:postgres@localhost:5432/postgres'\\}\\); pool\\.query\\('select 1 as ok'\\)\\.then\\(r => \\{ console\\.log\\('DB_OK', r\\.rows\\[0\\]\\); pool\\.end\\(\\); \\}\\)\\.catch\\(e => \\{ console\\.error\\('DB_ERROR', e\\.message\\); pool\\.end\\(\\); process\\.exit\\(1\\); \\}\\);\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

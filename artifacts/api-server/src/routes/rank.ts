@@ -10,7 +10,7 @@ import {
 } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { parseJobDescription, generateRationale } from "../lib/openai";
-import { scoreCandidate } from "../lib/scorer";
+import { createCandidateScorer } from "../lib/scorer";
 
 const router = Router();
 const QUICK_RANK_POOL_LIMIT = 10000;
@@ -49,11 +49,12 @@ router.post("/", async (req, res) => {
     const totalCandidatesResult = await pool.query<{ count: string }>("select count(*) as count from candidates");
     const totalCandidates = Number(totalCandidatesResult.rows[0]?.count ?? 0);
     const candidates = await db.select().from(candidatesTable).limit(QUICK_RANK_POOL_LIMIT);
+    const scoreCandidate = createCandidateScorer(job);
 
     const scored = candidates
       .map((candidate) => ({
         candidate,
-        score: scoreCandidate(job, candidate),
+        score: scoreCandidate(candidate),
       }))
       .sort((a, b) => {
         const scoreDiff = b.score.compositeScore - a.score.compositeScore;

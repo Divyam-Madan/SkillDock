@@ -11,6 +11,22 @@ export interface ScoreBreakdown {
   missingSkills: string[];
 }
 
+export type CandidateScoringProfile = Pick<
+  Candidate,
+  | "id"
+  | "name"
+  | "email"
+  | "currentTitle"
+  | "currentCompany"
+  | "yearsExperience"
+  | "educationLevel"
+  | "skills"
+  | "resumeText"
+  | "location"
+  | "linkedinUrl"
+  | "activityScore"
+>;
+
 const WEIGHTS = {
   semantic: 0.35,
   experience: 0.25,
@@ -130,7 +146,7 @@ function tokenize(text: string): string[] {
     .filter((t) => t.length > 1);
 }
 
-function candidateDocument(candidate: Candidate): string {
+function candidateDocument(candidate: CandidateScoringProfile): string {
   return [
     candidate.currentTitle ?? "",
     candidate.currentCompany ?? "",
@@ -149,31 +165,19 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
-function tfidfSimilarity(docA: string, docB: string, boostTerms: string[]): number {
-  if (!docA || !docB) return 0;
-  const tokensA = new Set(tokenize(docA));
-  const tokensB = tokenize(docB);
-  const boostSet = new Set(boostTerms.map(normalizeSkill));
-
-  let score = 0;
-  let totalWeight = 0;
-
-  const uniqueB = new Set(tokensB);
-  uniqueB.forEach((token) => {
-    const weight = boostSet.has(token) ? 3 : 1;
-    totalWeight += weight;
-    if (tokensA.has(token)) score += weight;
-  });
-
-  return totalWeight > 0 ? score / totalWeight : 0;
-}
-
-function scoreSkillMatch(job: Job, candidate: Candidate): { score: number; matched: string[]; missing: string[] } {
-  const jobRequiredSkills = asStringArray(job.requiredSkills);
-  const jobPreferredSkills = asStringArray(job.preferredSkills);
+function scoreSkillMatch(
+  job: Job,
+  candidate: CandidateScoringProfile,
+  requiredSkills: string[],
+  preferredSkills: string[],
+  required: string[],
+  preferred: string[],
+  evidenceGroups: typeof AI_RETRIEVAL_EVIDENCE,
+  maxEvidenceScore: number,
+  targetTokens: Map<string, number>,
+  totalTargetWeight: number,
+): { score: number; matched: string[]; missing: string[]; documentLower: string } {
   const rawCandidateSkills = asStringArray(candidate.skills);
-  const required = jobRequiredSkills.map(normalizeSkill);
-  const preferred = jobPreferredSkills.map(normalizeSkill);
   const candidateSkills = rawCandidateSkills.map(normalizeSkill);
   const doc = candidateDocument(candidate);
   const docLower = doc.toLowerCase();
@@ -187,27 +191,20 @@ function scoreSkillMatch(job: Job, candidate: Candidate): { score: number; match
   const matched: string[] = [];
   const missing: string[] = [];
 
-  for (const skill of jobRequiredSkills) {
+  for (const skill of requiredSkills) {
     if (hasSkill(normalizeSkill(skill))) matched.push(skill);
     else missing.push(skill);
   }
-  for (const skill of jobPreferredSkills) {
+  for (const skill of preferredSkills) {
     if (hasSkill(normalizeSkill(skill)) && !matched.includes(skill)) matched.push(skill);
   }
 
-  const roleIsAIRetrieval = `${job.title} ${job.rawText} ${job.domain ?? ""}`.toLowerCase();
-  const evidenceGroups = roleIsAIRetrieval.includes("retrieval") || roleIsAIRetrieval.includes("ranking") || roleIsAIRetrieval.includes("ai engineer")
-    ? AI_RETRIEVAL_EVIDENCE
-    : [];
-
   let evidenceScore = 0;
-  let maxEvidenceScore = 0;
   for (const group of evidenceGroups) {
-    maxEvidenceScore += group.weight;
     if (includesAny(docLower, group.terms)) {
       evidenceScore += group.weight;
       if (!matched.includes(group.label)) matched.push(group.label);
-    } else if (jobRequiredSkills.includes(group.label) && !missing.includes(group.label)) {
+    } else if (requiredSkills.includes(group.label) && !missing.includes(group.label)) {
       missing.push(group.label);
     }
   }
@@ -215,21 +212,20 @@ function scoreSkillMatch(job: Job, candidate: Candidate): { score: number; match
   const normalizedEvidence = maxEvidenceScore > 0 ? evidenceScore / maxEvidenceScore : 0;
   const productSignal = includesAny(docLower, PRODUCT_ENGINEERING_TERMS) ? 0.08 : 0;
 
-  const requiredHit = required.length > 0 ? matched.filter((s) => required.includes(normalizeSkill(s))).length / required.length : 0.5;
-  const preferredBonus = preferred.length > 0 ? Math.min(matched.filter((s) => preferred.includes(normalizeSkill(s))).length / preferred.length * 0.3, 0.3) : 0;
+  const requiredHit = required.length > 0 ? matched.filter((skill) => required.includes(normalizeSkill(skill))).length / required.length : 0.5;
+  const preferredBonus = preferred.length > 0 ? Math.min(matched.filter((skill) => preferred.includes(normalizeSkill(skill))).length / preferred.length * 0.3, 0.3) : 0;
 
-  // Also factor in resume text similarity
-  const resumeSim = tfidfSimilarity(
-    doc,
-    [job.rawText, ...jobRequiredSkills, ...jobPreferredSkills].join(" "),
-    [...jobRequiredSkills, ...jobPreferredSkills],
-  );
+  let matchedTargetWeight = 0;
+  for (const [token, weight] of targetTokens) {
+    if (resumeTokens.has(token)) matchedTargetWeight += weight;
+  }
+  const resumeSim = totalTargetWeight > 0 ? matchedTargetWeight / totalTargetWeight : 0;
 
   const score = Math.min(1, requiredHit * 0.25 + preferredBonus + resumeSim * 0.25 + normalizedEvidence * 0.42 + productSignal);
-  return { score, matched, missing };
+  return { score, matched, missing, documentLower: docLower };
 }
 
-function scoreExperience(job: Job, candidate: Candidate): number {
+function scoreExperience(job: Job, candidate: CandidateScoringProfile, jdText: string): number {
   const candidateYears = candidate.yearsExperience ?? 0;
   const required = job.minExperience ?? 0;
 
@@ -238,7 +234,6 @@ function scoreExperience(job: Job, candidate: Candidate): number {
   if (candidateYears >= required) {
     const excess = candidateYears - required;
     const base = Math.min(0.7 + excess * 0.03, 1.0);
-    const jdText = `${job.title} ${job.rawText}`.toLowerCase();
     if (jdText.includes("5") && jdText.includes("9") && candidateYears > 12) return Math.max(0.75, base - 0.12);
     return base;
   } else {
@@ -246,7 +241,7 @@ function scoreExperience(job: Job, candidate: Candidate): number {
   }
 }
 
-function scoreEducation(job: Job, candidate: Candidate): number {
+function scoreEducation(job: Job, candidate: CandidateScoringProfile): number {
   const eduReq = (job.educationRequirement ?? "").toLowerCase();
   const candidateEdu = (candidate.educationLevel ?? "").toLowerCase();
 
@@ -269,7 +264,7 @@ function scoreEducation(job: Job, candidate: Candidate): number {
   }
 }
 
-function scoreActivity(candidate: Candidate): number {
+function scoreActivity(candidate: CandidateScoringProfile): number {
   if (candidate.activityScore != null) {
     return Math.min(candidate.activityScore / 100, 1);
   }
@@ -279,12 +274,10 @@ function scoreActivity(candidate: Candidate): number {
   return 0.3 + (filled / fields.length) * 0.7;
 }
 
-function scoreTrajectory(job: Job, candidate: Candidate): number {
+function scoreTrajectory(job: Job, candidate: CandidateScoringProfile, doc: string): number {
   const title = (candidate.currentTitle ?? "").toLowerCase();
   const domain = (job.domain ?? "").toLowerCase();
   const seniority = (job.seniorityLevel ?? "").toLowerCase();
-  const doc = candidateDocument(candidate).toLowerCase();
-
   let score = 0.5;
 
   const seniorTerms = ["senior", "staff", "principal", "lead", "director", "vp", "head"];
@@ -313,28 +306,62 @@ function scoreTrajectory(job: Job, candidate: Candidate): number {
   return Math.max(0, Math.min(1, score));
 }
 
-export function scoreCandidate(job: Job, candidate: Candidate): ScoreBreakdown {
-  const { score: semanticRaw, matched, missing } = scoreSkillMatch(job, candidate);
-  const experienceRaw = scoreExperience(job, candidate);
-  const educationRaw = scoreEducation(job, candidate);
-  const activityRaw = scoreActivity(candidate);
-  const trajectoryRaw = scoreTrajectory(job, candidate);
+export function createCandidateScorer(job: Job): (candidate: CandidateScoringProfile) => ScoreBreakdown {
+  const requiredSkills = asStringArray(job.requiredSkills);
+  const preferredSkills = asStringArray(job.preferredSkills);
+  const required = requiredSkills.map(normalizeSkill);
+  const preferred = preferredSkills.map(normalizeSkill);
+  const jdText = `${job.title} ${job.rawText}`.toLowerCase();
+  const roleText = `${job.title} ${job.rawText} ${job.domain ?? ""}`.toLowerCase();
+  const evidenceGroups = roleText.includes("retrieval") || roleText.includes("ranking") || roleText.includes("ai engineer")
+    ? AI_RETRIEVAL_EVIDENCE
+    : [];
+  const maxEvidenceScore = evidenceGroups.reduce((total, group) => total + group.weight, 0);
+  const boostSet = new Set([...requiredSkills, ...preferredSkills].map(normalizeSkill));
+  const targetTokens = new Map<string, number>();
+  for (const token of new Set(tokenize([job.rawText, ...requiredSkills, ...preferredSkills].join(" ")))) {
+    targetTokens.set(token, boostSet.has(token) ? 3 : 1);
+  }
+  const totalTargetWeight = [...targetTokens.values()].reduce((total, weight) => total + weight, 0);
 
-  const composite =
-    semanticRaw * WEIGHTS.semantic +
-    experienceRaw * WEIGHTS.experience +
-    educationRaw * WEIGHTS.education +
-    activityRaw * WEIGHTS.activity +
-    trajectoryRaw * WEIGHTS.trajectory;
+  return (candidate) => {
+    const { score: semanticRaw, matched, missing, documentLower } = scoreSkillMatch(
+      job,
+      candidate,
+      requiredSkills,
+      preferredSkills,
+      required,
+      preferred,
+      evidenceGroups,
+      maxEvidenceScore,
+      targetTokens,
+      totalTargetWeight,
+    );
+    const experienceRaw = scoreExperience(job, candidate, jdText);
+    const educationRaw = scoreEducation(job, candidate);
+    const activityRaw = scoreActivity(candidate);
+    const trajectoryRaw = scoreTrajectory(job, candidate, documentLower);
 
-  return {
-    compositeScore: Math.round(composite * 100 * 10) / 10,
-    semanticScore: Math.round(semanticRaw * 100 * 10) / 10,
-    experienceScore: Math.round(experienceRaw * 100 * 10) / 10,
-    educationScore: Math.round(educationRaw * 100 * 10) / 10,
-    activityScore: Math.round(activityRaw * 100 * 10) / 10,
-    trajectoryScore: Math.round(trajectoryRaw * 100 * 10) / 10,
-    matchedSkills: matched,
-    missingSkills: missing,
+    const composite =
+      semanticRaw * WEIGHTS.semantic +
+      experienceRaw * WEIGHTS.experience +
+      educationRaw * WEIGHTS.education +
+      activityRaw * WEIGHTS.activity +
+      trajectoryRaw * WEIGHTS.trajectory;
+
+    return {
+      compositeScore: Math.round(composite * 100 * 10) / 10,
+      semanticScore: Math.round(semanticRaw * 100 * 10) / 10,
+      experienceScore: Math.round(experienceRaw * 100 * 10) / 10,
+      educationScore: Math.round(educationRaw * 100 * 10) / 10,
+      activityScore: Math.round(activityRaw * 100 * 10) / 10,
+      trajectoryScore: Math.round(trajectoryRaw * 100 * 10) / 10,
+      matchedSkills: matched,
+      missingSkills: missing,
+    };
   };
+}
+
+export function scoreCandidate(job: Job, candidate: CandidateScoringProfile): ScoreBreakdown {
+  return createCandidateScorer(job)(candidate);
 }
